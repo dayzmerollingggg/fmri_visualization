@@ -10,7 +10,6 @@ import os
 
 app = FastAPI()
 
-# Enable CORS for Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.getenv("FRONTEND_URL", "http://localhost:3000")],
@@ -19,57 +18,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.post("/api/process-groups")
-async def process_groups(
+@app.post("/api/process-npy-groups")
+async def process_npy_groups(
     files: list[UploadFile] = File(...),
-    # Json string format: {"sub-01.func.gii": "GroupA", "sub-02.func.gii": "GroupB"}
-    group_mapping: str = Form(...) 
+    # Expecting JSON string mapping filenames to groups:
+    # {"sub-control01_task-GoT_space-fsaverage5_hemi-L_denoised.npy": "GroupA", ...}
+    group_mapping: str = Form(...)
 ):
     try:
         mapping = json.loads(group_mapping)
-        group_a_data = []
-        group_b_data = []
+        group_a_mats = []
+        group_b_mats = []
 
-        # Temp directory to hold uploaded files
         with tempfile.TemporaryDirectory() as tmpdir:
             for file in files:
                 file_path = os.path.join(tmpdir, file.filename)
                 with open(file_path, "wb") as f:
                     f.write(await file.read())
-                
-                # Load GIFTI with Nibabel
-                gii = nib.load(file_path)
-                # Stack time-series arrays (Shape: [Vertices, Timepoints])
-                time_series = np.column_stack([darray.data for darray in gii.darrays])
-                
-                # Group assignment
+
+                # 1. Load the 2D NumPy array [Vertices, Timepoints]
+                arr = np.load(file_path)
+
                 group = mapping.get(file.filename)
                 if group == "GroupA":
-                    group_a_data.append(time_series)
+                    group_a_mats.append(arr)
                 elif group == "GroupB":
-                    group_b_data.append(time_series)
+                    group_b_mats.append(arr)
 
-            if not group_a_data or not group_b_data:
-                raise HTTPException(status_code=400, detail="Both groups must have at least 1 file.")
+            if not group_a_mats or not group_b_mats:
+                raise HTTPException(status_code=400, detail="Both Group A and Group B require at least 1 .npy file.")
 
-            # Compute group averages across subjects: (Axis 0 = Subject dimension)
-            group_a_mean = np.mean(np.array(group_a_data), axis=0) # [Vertices, TRs]
-            group_b_mean = np.mean(np.array(group_b_data), axis=0)
-            
-            # Compute differential map (Group A - Group B)
-            diff_map = group_a_mean - group_b_mean
+            # 2. Compute group averages across subjects (Axis 0)
+            mean_a = np.mean(np.array(group_a_mats), axis=0)  # Shape: [10242, TRs]
+            mean_b = np.mean(np.array(group_b_mats), axis=0)  # Shape: [10242, TRs]
 
-            # Convert result back to a GIFTI image
-            darrays = [nib.gifti.GiftiDataArray(data=diff_map[:, t].astype(np.float32)) 
-                       for t in range(diff_map.shape[1])]
-            output_gii = nib.gifti.GiftiImage(darrays=darrays)
-            
-            output_path = os.path.join(tmpdir, "group_diff_4d.func.gii")
-            nib.save(output_gii, output_path)
+            # 3. Compute differential signal map (Group A - Group B)
+            diff_map = mean_a - mean_b
+
+            # 4. Pack into a standard GIFTI 4D surface overlay
+            darrays = [
+                nib.gifti.GiftiDataArray(data=diff_map[:, t].astype(np.float32))
+                for t in range(diff_map.shape[1])
+            ]
+            gii_img = nib.gifti.GiftiImage(darrays=darrays)
+
+            output_path = os.path.join(tmpdir, "diff_fsaverage5_hemi-L.func.gii")
+            nib.save(gii_img, output_path)
 
             return FileResponse(
-                path=output_path, 
-                filename="group_diff_4d.func.gii", 
+                path=output_path,
+                filename="diff_fsaverage5_hemi-L.func.gii",
                 media_type="application/octet-stream"
             )
 
